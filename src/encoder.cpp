@@ -1,200 +1,269 @@
 #include "encoder.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include <spdlog/spdlog.h>
 
-#include "conversions.h"
-
-static enum AVPixelFormat get_encoder_default_pix_fmt(const AVCodec *encoder) {
-    const enum AVPixelFormat *p = encoder->pix_fmts;
-    if (!p) {
-        spdlog::error("No pixel formats supported by encoder");
-        return AV_PIX_FMT_NONE;
-    }
-    return *p;
+extern "C" {
+#include <libavutil/opt.h>
 }
 
-int init_encoder(
+#include "avutils.h"
+#include "conversions.h"
+
+Encoder::Encoder()
+    : ofmt_ctx_(nullptr), enc_ctx_(nullptr), out_vstream_idx_(-1), stream_map_(nullptr) {}
+
+Encoder::~Encoder() {
+    if (enc_ctx_) {
+        avcodec_free_context(&enc_ctx_);
+    }
+    if (ofmt_ctx_) {
+        if (!(ofmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&ofmt_ctx_->pb);
+        }
+        avformat_free_context(ofmt_ctx_);
+    }
+    if (stream_map_) {
+        av_free(stream_map_);
+    }
+}
+
+int Encoder::init(
     AVBufferRef *hw_ctx,
-    const char *out_fname,
+    const std::filesystem::path &out_fpath,
     AVFormatContext *ifmt_ctx,
-    AVFormatContext **ofmt_ctx,
-    AVCodecContext **enc_ctx,
     AVCodecContext *dec_ctx,
-    EncoderConfig *encoder_config,
-    int vstream_idx,
-    int **stream_map
+    EncoderConfig &enc_cfg,
+    int width,
+    int height,
+    int in_vstream_idx
 ) {
-    AVFormatContext *fmt_ctx = NULL;
-    AVCodecContext *codec_ctx = NULL;
-    int stream_index = 0;
     int ret;
 
-    avformat_alloc_output_context2(&fmt_ctx, NULL, NULL, out_fname);
-    if (!fmt_ctx) {
+    // Allocate the output format context
+    avformat_alloc_output_context2(&ofmt_ctx_, nullptr, nullptr, out_fpath.u8string().c_str());
+    if (!ofmt_ctx_) {
         spdlog::error("Could not create output context");
         return AVERROR_UNKNOWN;
     }
 
-    const AVCodec *encoder = avcodec_find_encoder(encoder_config->codec);
+    // Find the encoder
+    const AVCodec *encoder = avcodec_find_encoder(enc_cfg.codec);
     if (!encoder) {
         spdlog::error(
-            "Required video encoder not found for vcodec {}",
-            avcodec_get_name(encoder_config->codec)
+            "Required video encoder not found for codec {}", avcodec_get_name(enc_cfg.codec)
         );
         return AVERROR_ENCODER_NOT_FOUND;
     }
 
     // Create a new video stream in the output file
-    AVStream *out_stream = avformat_new_stream(fmt_ctx, NULL);
-    if (!out_stream) {
+    AVStream *out_vstream = avformat_new_stream(ofmt_ctx_, nullptr);
+    if (!out_vstream) {
         spdlog::error("Failed to allocate the output video stream");
         return AVERROR_UNKNOWN;
     }
+    out_vstream_idx_ = out_vstream->index;
 
-    codec_ctx = avcodec_alloc_context3(encoder);
-    if (!codec_ctx) {
+    // Allocate the encoder context
+    enc_ctx_ = avcodec_alloc_context3(encoder);
+    if (!enc_ctx_) {
         spdlog::error("Failed to allocate the encoder context");
         return AVERROR(ENOMEM);
     }
 
     // Set hardware device context
     if (hw_ctx != nullptr) {
-        codec_ctx->hw_device_ctx = av_buffer_ref(hw_ctx);
+        enc_ctx_->hw_device_ctx = av_buffer_ref(hw_ctx);
     }
 
-    // Set encoding parameters
-    codec_ctx->height = encoder_config->out_height;
-    codec_ctx->width = encoder_config->out_width;
-    codec_ctx->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
-    codec_ctx->bit_rate = encoder_config->bit_rate;
+    // Copy the color properties from the decoder context
+    enc_ctx_->color_range = dec_ctx->color_range;
+    enc_ctx_->color_primaries = dec_ctx->color_primaries;
+    enc_ctx_->color_trc = dec_ctx->color_trc;
+    enc_ctx_->colorspace = dec_ctx->colorspace;
+    enc_ctx_->chroma_sample_location = dec_ctx->chroma_sample_location;
+
+    // Extra options copied from the decoder context
+    enc_ctx_->sample_aspect_ratio = dec_ctx->sample_aspect_ratio;
+
+    // Set basic video options
+    enc_ctx_->width = width;
+    enc_ctx_->height = height;
+
+    // Set rate control and compression options
+    enc_ctx_->bit_rate = enc_cfg.bit_rate;
+    enc_ctx_->rc_buffer_size = enc_cfg.rc_buffer_size;
+    enc_ctx_->rc_min_rate = enc_cfg.rc_min_rate;
+    enc_ctx_->rc_max_rate = enc_cfg.rc_max_rate;
+    enc_ctx_->qmin = enc_cfg.qmin;
+    enc_ctx_->qmax = enc_cfg.qmax;
+
+    // Set GOP and frame structure options
+    enc_ctx_->gop_size = enc_cfg.gop_size;
+    enc_ctx_->max_b_frames = enc_cfg.max_b_frames;
+    enc_ctx_->keyint_min = enc_cfg.keyint_min;
+    enc_ctx_->refs = enc_cfg.refs;
+
+    // Set performance and threading options
+    enc_ctx_->thread_count = enc_cfg.thread_count;
+
+    // Set latency and buffering options
+    enc_ctx_->delay = enc_cfg.delay;
 
     // Set the pixel format
-    if (encoder_config->pix_fmt != AV_PIX_FMT_NONE) {
+    if (enc_cfg.pix_fmt != AV_PIX_FMT_NONE) {
         // Use the specified pixel format
-        codec_ctx->pix_fmt = encoder_config->pix_fmt;
+        enc_ctx_->pix_fmt = enc_cfg.pix_fmt;
     } else {
-        // Fall back to the default pixel format
-        codec_ctx->pix_fmt = get_encoder_default_pix_fmt(encoder);
-        if (codec_ctx->pix_fmt == AV_PIX_FMT_NONE) {
+        // Automatically select the pixel format
+        enc_ctx_->pix_fmt = get_encoder_default_pix_fmt(encoder, dec_ctx->pix_fmt);
+        if (enc_ctx_->pix_fmt == AV_PIX_FMT_NONE) {
             spdlog::error("Could not get the default pixel format for the encoder");
             return AVERROR(EINVAL);
         }
+        spdlog::debug("Auto-selected pixel format: {}", av_get_pix_fmt_name(enc_ctx_->pix_fmt));
     }
 
-    // Set the time base
-    codec_ctx->time_base = av_inv_q(dec_ctx->framerate);
-    if (codec_ctx->time_base.num == 0 || codec_ctx->time_base.den == 0) {
-        codec_ctx->time_base = av_inv_q(av_guess_frame_rate(ifmt_ctx, out_stream, NULL));
+    if (enc_cfg.frm_rate_mul > 0) {
+        AVRational in_frame_rate = get_video_frame_rate(ifmt_ctx, in_vstream_idx);
+        enc_ctx_->framerate = {in_frame_rate.num * enc_cfg.frm_rate_mul, in_frame_rate.den};
+        enc_ctx_->time_base = av_inv_q(enc_ctx_->framerate);
+    } else {
+        // Set the output video's time base
+        if (dec_ctx->time_base.num > 0 && dec_ctx->time_base.den > 0) {
+            enc_ctx_->time_base = dec_ctx->time_base;
+        } else {
+            enc_ctx_->time_base = av_inv_q(av_guess_frame_rate(ifmt_ctx, out_vstream, nullptr));
+        }
+
+        // Set the output video's frame rate
+        if (dec_ctx->framerate.num > 0 && dec_ctx->framerate.den > 0) {
+            enc_ctx_->framerate = dec_ctx->framerate;
+        } else {
+            enc_ctx_->framerate = av_guess_frame_rate(ifmt_ctx, out_vstream, nullptr);
+        }
     }
 
-    // Set the CRF and preset for any codecs that support it
-    char crf_str[16];
-    snprintf(crf_str, sizeof(crf_str), "%.f", static_cast<double>(encoder_config->crf));
-    av_opt_set(codec_ctx->priv_data, "crf", crf_str, 0);
-    av_opt_set(codec_ctx->priv_data, "preset", encoder_config->preset, 0);
+    // Set extra AVOptions
+    for (const auto &[opt_name, opt_value] : enc_cfg.extra_opts) {
+        std::string opt_name_str = wstring_to_u8string(opt_name);
+        std::string opt_value_str = wstring_to_u8string(opt_value);
+        spdlog::debug("Setting encoder option '{}' to '{}'", opt_name_str, opt_value_str);
 
-    if (fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
-        codec_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (av_opt_set(enc_ctx_->priv_data, opt_name_str.c_str(), opt_value_str.c_str(), 0) < 0) {
+            spdlog::warn("Failed to set encoder option '{}' to '{}'", opt_name_str, opt_value_str);
+        }
     }
 
-    if ((ret = avcodec_open2(codec_ctx, encoder, NULL)) < 0) {
+    // Use global headers if necessary
+    if (ofmt_ctx_->oformat->flags & AVFMT_GLOBALHEADER) {
+        enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    // Open the encoder
+    if ((ret = avcodec_open2(enc_ctx_, encoder, nullptr)) < 0) {
         spdlog::error("Cannot open video encoder");
         return ret;
     }
 
-    ret = avcodec_parameters_from_context(out_stream->codecpar, codec_ctx);
+    // Copy encoder parameters to output video stream
+    ret = avcodec_parameters_from_context(out_vstream->codecpar, enc_ctx_);
     if (ret < 0) {
         spdlog::error("Failed to copy encoder parameters to output video stream");
         return ret;
     }
 
-    out_stream->time_base = codec_ctx->time_base;
+    out_vstream->time_base = enc_ctx_->time_base;
+    out_vstream->avg_frame_rate = enc_ctx_->framerate;
+    out_vstream->r_frame_rate = enc_ctx_->framerate;
 
-    if (encoder_config->copy_streams) {
-        // Allocate the stream map
-        *stream_map =
-            reinterpret_cast<int *>(av_malloc_array(ifmt_ctx->nb_streams, sizeof(**stream_map)));
-        if (!*stream_map) {
+    // Copy other streams if necessary
+    if (enc_cfg.copy_streams) {
+        // Allocate the stream mape frame o
+        stream_map_ =
+            reinterpret_cast<int *>(av_malloc_array(ifmt_ctx->nb_streams, sizeof(*stream_map_)));
+        if (!stream_map_) {
             spdlog::error("Could not allocate stream mapping");
             return AVERROR(ENOMEM);
         }
 
-        // Map the video stream
-        (*stream_map)[vstream_idx] = stream_index++;
-
-        // Loop through each stream in the input file
+        // Map each input stream to an output stream
         for (int i = 0; i < static_cast<int>(ifmt_ctx->nb_streams); i++) {
             AVStream *in_stream = ifmt_ctx->streams[i];
             AVCodecParameters *in_codecpar = in_stream->codecpar;
 
-            if (i == vstream_idx) {
-                // Video stream is already handled
+            // Skip the input video stream as it's already processed
+            if (i == in_vstream_idx) {
+                stream_map_[i] = out_vstream_idx_;
                 continue;
             }
 
+            // Map only audio and subtitle streams (skip other types)
             if (in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
                 in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
-                (*stream_map)[i] = -1;
+                stream_map_[i] = -1;
+                spdlog::warn("Skipping unsupported stream type at index: {}", i);
                 continue;
             }
 
-            // Create corresponding output stream
-            AVStream *out_copied_stream = avformat_new_stream(fmt_ctx, NULL);
-            if (!out_copied_stream) {
+            // Create corresponding output stream for audio and subtitle streams
+            AVStream *out_stream = avformat_new_stream(ofmt_ctx_, nullptr);
+            if (!out_stream) {
                 spdlog::error("Failed allocating output stream");
                 return AVERROR_UNKNOWN;
             }
 
-            ret = avcodec_parameters_copy(out_copied_stream->codecpar, in_codecpar);
+            // Copy codec parameters from input to output
+            ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar);
             if (ret < 0) {
                 spdlog::error("Failed to copy codec parameters");
                 return ret;
             }
-            out_copied_stream->codecpar->codec_tag = 0;
+            out_stream->codecpar->codec_tag = 0;
 
             // Copy time base
-            out_copied_stream->time_base = in_stream->time_base;
+            out_stream->time_base = in_stream->time_base;
 
-            (*stream_map)[i] = stream_index++;
+            // Map input stream index to output stream index
+            spdlog::debug("Stream mapping: {} (in) -> {} (out)", i, out_stream->index);
+            stream_map_[i] = out_stream->index;
         }
     }
 
     // Open the output file
-    if (!(fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
-        ret = avio_open(&fmt_ctx->pb, out_fname, AVIO_FLAG_WRITE);
+    if (!(ofmt_ctx_->oformat->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&ofmt_ctx_->pb, out_fpath.u8string().c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) {
-            spdlog::error("Could not open output file '{}'", out_fname);
+            spdlog::error("Could not open output file '{}'", out_fpath.u8string());
             return ret;
         }
     }
 
-    *ofmt_ctx = fmt_ctx;
-    *enc_ctx = codec_ctx;
+    // Write the output file header
+    ret = avformat_write_header(ofmt_ctx_, nullptr);
+    if (ret < 0) {
+        spdlog::error("Error writing output file header");
+        return ret;
+    }
 
     return 0;
 }
 
-int encode_and_write_frame(
-    AVFrame *frame,
-    AVCodecContext *enc_ctx,
-    AVFormatContext *ofmt_ctx,
-    int vstream_idx
-) {
+int Encoder::write_frame(AVFrame *frame, int64_t frame_idx) {
     AVFrame *converted_frame = nullptr;
     int ret;
 
+    // Set the frame's presentation timestamp if not set
+    if (frame->pts <= 0) {
+        frame->pts = frame_idx;
+    }
+
     // Convert the frame to the encoder's pixel format if needed
-    if (frame->format != enc_ctx->pix_fmt) {
-        converted_frame = convert_avframe_pix_fmt(frame, enc_ctx->pix_fmt);
+    if (frame->format != enc_ctx_->pix_fmt) {
+        converted_frame = convert_avframe_pix_fmt(frame, enc_ctx_->pix_fmt);
         if (!converted_frame) {
             spdlog::error("Error converting frame to encoder's pixel format");
             return AVERROR_EXTERNAL;
         }
-
         converted_frame->pts = frame->pts;
     }
 
@@ -204,11 +273,12 @@ int encode_and_write_frame(
         return AVERROR(ENOMEM);
     }
 
+    // Send the frame to the encoder
     if (converted_frame != nullptr) {
-        ret = avcodec_send_frame(enc_ctx, converted_frame);
+        ret = avcodec_send_frame(enc_ctx_, converted_frame);
         av_frame_free(&converted_frame);
     } else {
-        ret = avcodec_send_frame(enc_ctx, frame);
+        ret = avcodec_send_frame(enc_ctx_, frame);
     }
     if (ret < 0) {
         spdlog::error("Error sending frame to encoder");
@@ -216,8 +286,9 @@ int encode_and_write_frame(
         return ret;
     }
 
+    // Receive packets from the encoder
     while (ret >= 0) {
-        ret = avcodec_receive_packet(enc_ctx, enc_pkt);
+        ret = avcodec_receive_packet(enc_ctx_, enc_pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             av_packet_unref(enc_pkt);
             break;
@@ -229,12 +300,12 @@ int encode_and_write_frame(
 
         // Rescale packet timestamps
         av_packet_rescale_ts(
-            enc_pkt, enc_ctx->time_base, ofmt_ctx->streams[vstream_idx]->time_base
+            enc_pkt, enc_ctx_->time_base, ofmt_ctx_->streams[out_vstream_idx_]->time_base
         );
-        enc_pkt->stream_index = vstream_idx;
+        enc_pkt->stream_index = out_vstream_idx_;
 
         // Write the packet
-        ret = av_interleaved_write_frame(ofmt_ctx, enc_pkt);
+        ret = av_interleaved_write_frame(ofmt_ctx_, enc_pkt);
         av_packet_unref(enc_pkt);
         if (ret < 0) {
             spdlog::error("Error muxing packet");
@@ -247,7 +318,7 @@ int encode_and_write_frame(
     return 0;
 }
 
-int flush_encoder(AVCodecContext *enc_ctx, AVFormatContext *ofmt_ctx) {
+int Encoder::flush() {
     int ret;
     AVPacket *enc_pkt = av_packet_alloc();
     if (!enc_pkt) {
@@ -255,27 +326,37 @@ int flush_encoder(AVCodecContext *enc_ctx, AVFormatContext *ofmt_ctx) {
         return AVERROR(ENOMEM);
     }
 
-    ret = avcodec_send_frame(enc_ctx, NULL);
-    while (ret >= 0) {
-        ret = avcodec_receive_packet(enc_ctx, enc_pkt);
+    // Send a NULL frame to signal the encoder to flush
+    ret = avcodec_send_frame(enc_ctx_, nullptr);
+    if (ret < 0) {
+        spdlog::error("Error sending NULL frame to encoder during flush");
+        av_packet_free(&enc_pkt);
+        return ret;
+    }
+
+    // Receive and write packets until flushing is complete
+    while (true) {
+        ret = avcodec_receive_packet(enc_ctx_, enc_pkt);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             av_packet_unref(enc_pkt);
             break;
         } else if (ret < 0) {
-            spdlog::error("Error encoding frame");
+            spdlog::error("Error encoding packet during flush");
             av_packet_free(&enc_pkt);
             return ret;
         }
 
         // Rescale packet timestamps
-        av_packet_rescale_ts(enc_pkt, enc_ctx->time_base, ofmt_ctx->streams[0]->time_base);
-        enc_pkt->stream_index = ofmt_ctx->streams[0]->index;
+        av_packet_rescale_ts(
+            enc_pkt, enc_ctx_->time_base, ofmt_ctx_->streams[out_vstream_idx_]->time_base
+        );
+        enc_pkt->stream_index = out_vstream_idx_;
 
         // Write the packet
-        ret = av_interleaved_write_frame(ofmt_ctx, enc_pkt);
+        ret = av_interleaved_write_frame(ofmt_ctx_, enc_pkt);
         av_packet_unref(enc_pkt);
         if (ret < 0) {
-            spdlog::error("Error muxing packet");
+            spdlog::error("Error muxing packet during flush");
             av_packet_free(&enc_pkt);
             return ret;
         }
@@ -283,4 +364,20 @@ int flush_encoder(AVCodecContext *enc_ctx, AVFormatContext *ofmt_ctx) {
 
     av_packet_free(&enc_pkt);
     return 0;
+}
+
+AVCodecContext *Encoder::get_encoder_context() const {
+    return enc_ctx_;
+}
+
+AVFormatContext *Encoder::get_format_context() const {
+    return ofmt_ctx_;
+}
+
+int Encoder::get_output_video_stream_index() const {
+    return out_vstream_idx_;
+}
+
+int *Encoder::get_stream_map() const {
+    return stream_map_;
 }

@@ -1,5 +1,4 @@
-#ifndef PLACEBO_H
-#define PLACEBO_H
+#pragma once
 
 #include <filesystem>
 
@@ -9,14 +8,12 @@ extern "C" {
 }
 
 int init_libplacebo(
-    AVBufferRef *hw_ctx,
     AVFilterGraph **filter_graph,
     AVFilterContext **buffersrc_ctx,
     AVFilterContext **buffersink_ctx,
     AVCodecContext *dec_ctx,
     int out_width,
     int out_height,
+    uint32_t vk_device_index,
     const std::filesystem::path &shader_path
 );
-
-#endif  // PLACEBO_H

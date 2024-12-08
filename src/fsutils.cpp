@@ -1,7 +1,7 @@
 #include "fsutils.h"
 
 #if _WIN32
-#include <windows.h>
+#include <Windows.h>
 #include <cwchar>
 #else
 #include <unistd.h>
@@ -75,7 +75,7 @@ std::filesystem::path find_resource_file(const std::filesystem::path &path) {
     return get_executable_directory() / path;
 }
 
-std::string path_to_string(const std::filesystem::path &path) {
+std::string path_to_u8string(const std::filesystem::path &path) {
 #if _WIN32
     std::wstring wide_path = path.wstring();
     int buffer_size =
@@ -90,5 +90,48 @@ std::string path_to_string(const std::filesystem::path &path) {
     return std::string(buffer.data());
 #else
     return path.string();
+#endif
+}
+
+#ifdef _WIN32
+std::string wstring_to_u8string(const std::wstring &wstr) {
+    if (wstr.empty()) {
+        return std::string();
+    }
+    int size_needed = WideCharToMultiByte(
+        CP_UTF8, 0, wstr.data(), static_cast<int>(wstr.size()), nullptr, 0, nullptr, nullptr
+    );
+    std::string converted_str(size_needed, 0);
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        wstr.data(),
+        static_cast<int>(wstr.size()),
+        &converted_str[0],
+        size_needed,
+        nullptr,
+        nullptr
+    );
+    return converted_str;
+}
+#else
+std::string wstring_to_u8string(const std::string &str) {
+    return str;
+}
+#endif
+
+StringType path_to_string_type(const std::filesystem::path &path) {
+#if _WIN32
+    return path.wstring();
+#else
+    return path.string();
+#endif
+}
+
+StringType to_string_type(int value) {
+#if _WIN32
+    return std::to_wstring(value);
+#else
+    return std::to_string(value);
 #endif
 }
