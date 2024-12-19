@@ -1,6 +1,7 @@
-#ifndef VERSION_H
-#define VERSION_H
+#pragma once
+
+namespace video2x {
 
 #define LIBVIDEO2X_VERSION_STRING "@PROJECT_VERSION@"
 
-#endif  // VERSION_H
+}  // namespace video2x

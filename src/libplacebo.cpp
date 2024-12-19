@@ -2,23 +2,39 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
+
+extern "C" {
+#include <libavutil/dict.h>
+#include <libavutil/opt.h>
+}
 
 #include <spdlog/spdlog.h>
 
-#include "fsutils.h"
+namespace video2x {
+namespace processors {
 
 int init_libplacebo(
-    AVBufferRef *hw_ctx,
     AVFilterGraph **filter_graph,
     AVFilterContext **buffersrc_ctx,
     AVFilterContext **buffersink_ctx,
     AVCodecContext *dec_ctx,
     int out_width,
     int out_height,
+    uint32_t vk_device_index,
     const std::filesystem::path &shader_path
 ) {
-    char args[512];
     int ret;
+
+    // Create the Vulkan hardware device context
+    AVBufferRef *vk_hw_device_ctx = nullptr;
+    ret = av_hwdevice_ctx_create(
+        &vk_hw_device_ctx, AV_HWDEVICE_TYPE_VULKAN, std::to_string(vk_device_index).c_str(), NULL, 0
+    );
+    if (ret < 0) {
+        spdlog::error("Failed to create Vulkan hardware device context for libplacebo.");
+        vk_hw_device_ctx = nullptr;
+    }
 
     AVFilterGraph *graph = avfilter_graph_alloc();
     if (!graph) {
@@ -28,25 +44,43 @@ int init_libplacebo(
 
     // Create buffer source
     const AVFilter *buffersrc = avfilter_get_by_name("buffer");
-    snprintf(
-        args,
-        sizeof(args),
-        "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:frame_rate=%d/%d:"
-        "pixel_aspect=%d/%d:colorspace=%d:range=%d",
-        dec_ctx->width,
-        dec_ctx->height,
-        dec_ctx->pix_fmt,
-        dec_ctx->time_base.num,
-        dec_ctx->time_base.den,
-        dec_ctx->framerate.num,
-        dec_ctx->framerate.den,
-        dec_ctx->sample_aspect_ratio.num,
-        dec_ctx->sample_aspect_ratio.den,
-        dec_ctx->colorspace,
-        dec_ctx->color_range
-    );
+    if (!buffersrc) {
+        spdlog::error("Filter 'buffer' not found.");
+        avfilter_graph_free(&graph);
+        return AVERROR_FILTER_NOT_FOUND;
+    }
 
-    ret = avfilter_graph_create_filter(buffersrc_ctx, buffersrc, "in", args, NULL, graph);
+    // Start building the arguments string
+    std::string args = "video_size=" + std::to_string(dec_ctx->width) + "x" +
+                       std::to_string(dec_ctx->height) +
+                       ":pix_fmt=" + std::to_string(dec_ctx->pix_fmt) +
+                       ":time_base=" + std::to_string(dec_ctx->time_base.num) + "/" +
+                       std::to_string(dec_ctx->time_base.den) +
+                       ":frame_rate=" + std::to_string(dec_ctx->framerate.num) + "/" +
+                       std::to_string(dec_ctx->framerate.den) +
+                       ":pixel_aspect=" + std::to_string(dec_ctx->sample_aspect_ratio.num) + "/" +
+                       std::to_string(dec_ctx->sample_aspect_ratio.den);
+
+    // Make a copy of the AVClass on the stack
+    AVClass priv_class_copy = *buffersrc->priv_class;
+    AVClass *priv_class_copy_ptr = &priv_class_copy;
+
+    // Check if the colorspace option is supported
+    if (av_opt_find(&priv_class_copy_ptr, "colorspace", NULL, 0, AV_OPT_SEARCH_FAKE_OBJ)) {
+        args += ":colorspace=" + std::to_string(dec_ctx->colorspace);
+    } else {
+        spdlog::warn("Option 'colorspace' is not supported by the buffer filter.");
+    }
+
+    // Check if the range option is supported
+    if (av_opt_find(&priv_class_copy_ptr, "range", NULL, 0, AV_OPT_SEARCH_FAKE_OBJ)) {
+        args += ":range=" + std::to_string(dec_ctx->color_range);
+    } else {
+        spdlog::warn("Option 'range' is not supported by the buffer filter.");
+    }
+
+    spdlog::debug("Buffer source args: {}", args);
+    ret = avfilter_graph_create_filter(buffersrc_ctx, buffersrc, "in", args.c_str(), NULL, graph);
     if (ret < 0) {
         spdlog::error("Cannot create buffer source.");
         avfilter_graph_free(&graph);
@@ -64,7 +98,7 @@ int init_libplacebo(
     }
 
     // Convert the shader path to a string since filter args is const char *
-    std::string shader_path_string = path_to_string(shader_path);
+    std::string shader_path_string = shader_path.u8string();
 
 #ifdef _WIN32
     // libplacebo does not recognize the Windows '\\' path separator
@@ -72,19 +106,13 @@ int init_libplacebo(
 #endif
 
     // Prepare the filter arguments
-    char filter_args[512];
-    snprintf(
-        filter_args,
-        sizeof(filter_args),
-        "w=%d:h=%d:upscaler=ewa_lanczos:custom_shader_path=%s",
-        out_width,
-        out_height,
-        shader_path_string.c_str()
-    );
+    std::string filter_args = "w=" + std::to_string(out_width) +
+                              ":h=" + std::to_string(out_height) + ":custom_shader_path='" +
+                              shader_path_string + "'";
 
     AVFilterContext *libplacebo_ctx;
     ret = avfilter_graph_create_filter(
-        &libplacebo_ctx, libplacebo_filter, "libplacebo", filter_args, NULL, graph
+        &libplacebo_ctx, libplacebo_filter, "libplacebo", filter_args.c_str(), NULL, graph
     );
     if (ret < 0) {
         spdlog::error("Cannot create libplacebo filter.");
@@ -93,8 +121,9 @@ int init_libplacebo(
     }
 
     // Set the hardware device context to Vulkan
-    if (hw_ctx != nullptr) {
-        libplacebo_ctx->hw_device_ctx = av_buffer_ref(hw_ctx);
+    if (vk_hw_device_ctx != nullptr) {
+        libplacebo_ctx->hw_device_ctx = av_buffer_ref(vk_hw_device_ctx);
+        av_buffer_unref(&vk_hw_device_ctx);
     }
 
     // Link buffersrc to libplacebo
@@ -135,3 +164,6 @@ int init_libplacebo(
     *filter_graph = graph;
     return 0;
 }
+
+}  // namespace processors
+}  // namespace video2x

@@ -1,9 +1,19 @@
-#ifndef LIBVIDEO2X_H
-#define LIBVIDEO2X_H
+#pragma once
 
-#include <stdbool.h>
-#include <stdint.h>
-#include <time.h>
+#include <atomic>
+#include <cstdint>
+#include <memory>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+}
+
+#include "avutils.h"
+#include "decoder.h"
+#include "encoder.h"
+#include "logutils.h"
+#include "processor.h"
 
 #ifdef _WIN32
 #ifdef LIBVIDEO2X_EXPORTS
@@ -15,90 +25,81 @@
 #define LIBVIDEO2X_API
 #endif
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace video2x {
 
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-
-// Enum to specify filter type
-enum FilterType {
-    FILTER_LIBPLACEBO,
-    FILTER_REALESRGAN
+enum class VideoProcessorState {
+    Idle,
+    Running,
+    Paused,
+    Failed,
+    Aborted,
+    Completed
 };
 
-// Enum to specify log level
-enum Libvideo2xLogLevel {
-    LIBVIDEO2X_LOG_LEVEL_TRACE,
-    LIBVIDEO2X_LOG_LEVEL_DEBUG,
-    LIBVIDEO2X_LOG_LEVEL_INFO,
-    LIBVIDEO2X_LOG_LEVEL_WARNING,
-    LIBVIDEO2X_LOG_LEVEL_ERROR,
-    LIBVIDEO2X_LOG_LEVEL_CRITICAL,
-    LIBVIDEO2X_LOG_LEVEL_OFF
+class LIBVIDEO2X_API VideoProcessor {
+   public:
+    VideoProcessor(
+        const processors::ProcessorConfig proc_cfg,
+        const encoder::EncoderConfig enc_cfg,
+        const uint32_t vk_device_idx = 0,
+        const AVHWDeviceType hw_device_type = AV_HWDEVICE_TYPE_NONE,
+        const logutils::Video2xLogLevel = logutils::Video2xLogLevel::Info,
+        const bool benchmark = false
+    );
+
+    virtual ~VideoProcessor() = default;
+
+    [[nodiscard]] int
+    process(const std::filesystem::path in_fname, const std::filesystem::path out_fname);
+
+    void pause() { state_.store(VideoProcessorState::Paused); }
+    void resume() { state_.store(VideoProcessorState::Running); }
+    void abort() { state_.store(VideoProcessorState::Aborted); }
+
+    VideoProcessorState get_state() const { return state_.load(); }
+    int64_t get_processed_frames() const { return frame_idx_.load(); }
+    int64_t get_total_frames() const { return total_frames_.load(); }
+
+   private:
+    [[nodiscard]] int process_frames(
+        decoder::Decoder &decoder,
+        encoder::Encoder &encoder,
+        std::unique_ptr<processors::Processor> &processor
+    );
+
+    [[nodiscard]] int write_frame(AVFrame *frame, encoder::Encoder &encoder);
+
+    [[nodiscard]] inline int write_raw_packet(
+        AVPacket *packet,
+        AVFormatContext *ifmt_ctx,
+        AVFormatContext *ofmt_ctx,
+        int *stream_map
+    );
+
+    [[nodiscard]] inline int process_filtering(
+        std::unique_ptr<processors::Processor> &processor,
+        encoder::Encoder &encoder,
+        AVFrame *frame,
+        AVFrame *proc_frame
+    );
+
+    [[nodiscard]] inline int process_interpolation(
+        std::unique_ptr<processors::Processor> &processor,
+        encoder::Encoder &encoder,
+        std::unique_ptr<AVFrame, decltype(&avutils::av_frame_deleter)> &prev_frame,
+        AVFrame *frame,
+        AVFrame *proc_frame
+    );
+
+    processors::ProcessorConfig proc_cfg_;
+    encoder::EncoderConfig enc_cfg_;
+    uint32_t vk_device_idx_ = 0;
+    AVHWDeviceType hw_device_type_ = AV_HWDEVICE_TYPE_NONE;
+    bool benchmark_ = false;
+
+    std::atomic<VideoProcessorState> state_ = VideoProcessorState::Idle;
+    std::atomic<int64_t> frame_idx_ = 0;
+    std::atomic<int64_t> total_frames_ = 0;
 };
 
-// Configuration for Libplacebo filter
-struct LibplaceboConfig {
-    int out_width;
-    int out_height;
-    const char *shader_path;
-};
-
-// Configuration for RealESRGAN filter
-struct RealESRGANConfig {
-    int gpuid;
-    bool tta_mode;
-    int scaling_factor;
-    const char *model;
-};
-
-// Unified filter configuration
-struct FilterConfig {
-    enum FilterType filter_type;
-    union {
-        struct LibplaceboConfig libplacebo;
-        struct RealESRGANConfig realesrgan;
-    } config;
-};
-
-// Encoder configuration
-struct EncoderConfig {
-    int out_width;
-    int out_height;
-    bool copy_streams;
-    enum AVCodecID codec;
-    enum AVPixelFormat pix_fmt;
-    const char *preset;
-    int64_t bit_rate;
-    float crf;
-};
-
-// Video processing context
-struct VideoProcessingContext {
-    int64_t processed_frames;
-    int64_t total_frames;
-    time_t start_time;
-    bool pause;
-    bool abort;
-    bool completed;
-};
-
-// C-compatible process_video function
-LIBVIDEO2X_API int process_video(
-    const char *in_fname,
-    const char *out_fname,
-    enum Libvideo2xLogLevel log_level,
-    bool benchmark,
-    enum AVHWDeviceType hw_device_type,
-    const struct FilterConfig *filter_config,
-    struct EncoderConfig *encoder_config,
-    struct VideoProcessingContext *proc_ctx
-);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif  // LIBVIDEO2X_H
+}  // namespace video2x
